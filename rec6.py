@@ -990,6 +990,13 @@ def dec_val(c, raw):
 # so a correct layout makes each record end where the next one starts.
 REC_INSTANT = 4
 
+# Spacer fields, as (index, width, nullable). MariaDB keeps an instantly
+# dropped column inside every older record while deleting it from
+# SYS_COLUMNS, so a table can be physically wider than its dictionary. The
+# only way to test that is to put a spacer into the field order and see
+# whether records start tiling. Empty in normal operation.
+GHOSTS = []
+
 
 def order_for(sch, pk):
     by = {}
@@ -1003,6 +1010,13 @@ def order_for(sch, pk):
     for c in sch['cols']:
         if c['name'] not in pks:
             order.append(dict(c))
+    for n, g in enumerate(GHOSTS):
+        at, w, nul = g
+        order.insert(min(max(at, 0), len(order)),
+                     dict(name='_ghost%d' % n, ghost=True, len=w,
+                          var=(w == 0), notnull=not nul, mt=4, pr=0,
+                          code=254, cs=63, amb=False, unsigned=False,
+                          sql='binary(%d)' % w))
     return order, pk
 
 
@@ -1031,7 +1045,7 @@ def build_layout(sch, pk, conv, n_core, chvar=None):
                 total=len(order), chvar=chvar)
 
 
-def parse_rec(pg, o, lay, keep_deleted=False):
+def parse_rec(pg, o, lay, keep_deleted=False, trace=None):
     if o < 12 or o + 2 > PG:
         return dict(err='bounds')
     info = pg[o - 5]
@@ -1089,12 +1103,14 @@ def parse_rec(pg, o, lay, keep_deleted=False):
         if L < 0 or p + L > PG:
             return dict(err='len', start=pos)
         raw = pg[p:p + L]
+        if trace is not None:
+            trace.append((nm, p, L, 1 if c.get('var') else 0))
         p += L
-        if c.get('sys'):
+        if c.get('sys') or c.get('ghost'):
             continue
         row[nm] = extern_note(raw) if ext.get(nm) else dec_val(c, raw)
     return dict(row=row, start=pos, end=p, status=status, nf=n_fields,
-                deleted=deleted)
+                deleted=deleted, base=base, nbm=nbm)
 
 
 def page_records(pg, lay, keep_deleted=True):
@@ -1384,6 +1400,7 @@ def do_dump(pos, opt):
     limit = int(opt.get('limit', 0))
     keep_del = bool(opt.get('deleted'))
     known = opt.get('merge', DEF_DEFS)
+    set_ghosts(opt)
     os.makedirs(outdir, exist_ok=True)
     sch, info = build_schema(paths, db)
     for line in info:
@@ -1432,6 +1449,7 @@ def do_diag(pos, opt):
     paths = [opt.get('dict', DEF_DICT)]
     db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
     nrec = int(opt.get('recs', 2))
+    set_ghosts(opt)
     sch, _ = build_schema(paths, db)
     s = sch.get(nm)
     if not s:
@@ -1514,14 +1532,112 @@ def do_xcheck(pos, opt):
     print('  iparse rows %d identical %d' % (len(b2), len(set(a) & set(b2))))
 
 
+def set_ghosts(opt):
+    # --ghost 3:13,10:16n puts spacer fields into the record layout: 13 bytes
+    # before field 3, and a nullable 16-byte field before field 10. Width 0
+    # means a variable-length spacer that eats one length byte.
+    del GHOSTS[:]
+    spec = opt.get('ghost')
+    if not spec:
+        return
+    for part in str(spec).split(','):
+        if not part:
+            continue
+        nul = part.endswith('n')
+        at, w = (part[:-1] if nul else part).split(':')
+        GHOSTS.append((int(at), int(w), nul))
+    print('# ghosts at:width:null %s' % GHOSTS)
+
+
+def hexdump(pg, a, b, width=24):
+    out = []
+    p = max(0, a)
+    while p < b:
+        chunk = bytes(pg[p:min(b, p + width)])
+        h = ''
+        for i in range(0, len(chunk), 4):
+            h += chunk[i:i + 4].hex() + ' '
+        txt = ''
+        for ch in chunk:
+            txt += chr(ch) if 32 <= ch < 127 else '.'
+        out.append('%5d %-*s|%s|' % (p, width * 2 + width // 4, h, txt))
+        p += width
+    return out
+
+
+def do_hex(pos, opt):
+    # One record byte for byte, next to the widths the layout assumes.
+    # Where the two disagree, the missing bytes become visible.
+    nm = opt.get('table', 'users')
+    src = opt.get('in', DEF_OUT)
+    paths = [opt.get('dict', DEF_DICT)]
+    db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
+    nrec = int(opt.get('recs', 1))
+    skip = int(opt.get('skip', 0))
+    set_ghosts(opt)
+    sch, _ = build_schema(paths, db)
+    s = sch.get(nm)
+    if not s:
+        print('no dictionary entry for %s' % nm)
+        return
+    prep(s, nm, opt.get('merge', DEF_DEFS))
+    files, ix, why = choose_files(src, nm, s)
+    if not files:
+        print('no pages for %s in %s' % (nm, src))
+        return
+    sample = sample_pages(files)
+    if not sample:
+        print('no leaf pages with records')
+        return
+    pg = sample[0]
+    sc, lay = solve_layout(sample, s)
+    offs, o = [], 99
+    for _ in range(PG // 5):
+        o = (o + u(pg, o - 2, 2)) & 0xFFFF
+        if o == 112 or o < 99 or o >= PG:
+            break
+        offs.append(o)
+    print('%s page=%d recs=%d core=%d/%d fit=%s sanity=%s'
+          % (nm, u(pg, 4, 4), len(offs), lay['n_core'], lay['total'],
+             sc[0], sc[1]))
+    for i in range(skip, min(skip + nrec, len(offs))):
+        o = offs[i]
+        tr = []
+        r = parse_rec(pg, o, lay, True, tr)
+        if r.get('err'):
+            print('rec@%d err=%s' % (o, r['err']))
+            continue
+        nxt = 0
+        if i + 1 < len(offs):
+            r2 = parse_rec(pg, offs[i + 1], lay, True)
+            nxt = r2.get('start') or 0
+        seen = {}
+        for t in tr:
+            seen[t[0]] = t
+        w = []
+        for c in lay['prep'](r['nf'])[0]:
+            t = seen.get(c['name'])
+            w.append('n' if t is None
+                     else (('v%d' % t[2]) if t[3] else str(t[2])))
+        print('rec@%d st=%d nf=%d nbm=%d extra=%s'
+              % (o, r['status'], r['nf'], r['nbm'],
+                 bytes(pg[r['start']:o]).hex()))
+        print(' w=%s' % ','.join(w))
+        print(' calc_end=%d true_end=%d short=%d'
+              % (r['end'], nxt, (nxt - r['end']) if nxt else 0))
+        for line in hexdump(pg, o, max(r['end'], nxt)):
+            print(line)
+
+
 MODES = {"cols": do_cols, "defs": do_defs, "dump": do_dump,
-         "xcheck": do_xcheck, "diag": do_diag, "probe": do_probe, "map": do_map, "inv": do_inv,
+         "xcheck": do_xcheck, "diag": do_diag,
+         "hex": do_hex, "probe": do_probe, "map": do_map, "inv": do_inv,
          "plan": do_plan, "auto": do_auto, "pull": do_pull}
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in MODES:
-        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck ...")
+        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex ...")
         return 1
     pos, opt = split_args(sys.argv[2:])
     MODES[sys.argv[1]](pos, opt)
