@@ -685,14 +685,29 @@ MB_CS = set([33, 45, 46, 83, 192, 193, 194, 195, 196, 197, 198, 199, 200,
              275, 309, 326])
 
 
+# A CHAR column is stored at fixed width only when its charset has
+# mbminlen == mbmaxlen. utf8mb4, utf8mb3, ucs2, utf16, gbk and MariaDB's
+# newer collation ids all store CHAR with a length byte, exactly like
+# VARCHAR. So an unknown charset must default to variable length: reading
+# such a column as fixed shifts the whole length array and destroys every
+# column that follows it. SB_CS lists the single-byte charsets; anything
+# else is variable, and the layout solver double-checks the choice.
+SB_CS = set([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 18, 20, 21, 22,
+             23, 25, 26, 27, 29, 30, 31, 32, 34, 36, 37, 38, 39, 40, 41,
+             42, 43, 44, 47, 48, 49, 50, 51, 52, 53, 57, 58, 59, 63, 64,
+             65, 66, 68, 69, 70, 71, 72, 73, 74, 75, 77, 78, 79, 80, 81,
+             82, 89, 92, 93, 94, 99])   # 84 is big5_bin: multi-byte
+VAR_MT = (1, 4, 5, 11, 12, 14)
+
+
 def col_meta(name, mt, pr, ln):
     # One column, carrying both def-file text and decode metadata.
     cs = (pr >> 16) & 0xFFFF
-    var = mt in (1, 5, 12)
-    if mt in (2, 13) and cs in MB_CS:
-        var = True
+    binary = bool(pr & 1024) or cs == 63
+    amb = mt in (2, 13) and not binary
     return dict(name=name, mt=mt, pr=pr, len=ln, code=pr & 0xFF, cs=cs,
-                var=var, notnull=bool(pr & NOT_NULL),
+                var=mt in VAR_MT or (amb and cs not in SB_CS), amb=amb,
+                notnull=bool(pr & NOT_NULL),
                 unsigned=bool(pr & UNSIGNED), sql=sql_type(mt, pr, ln))
 
 
@@ -987,12 +1002,18 @@ def order_for(sch, pk):
     pks = set(pk)
     for c in sch['cols']:
         if c['name'] not in pks:
-            order.append(c)
+            order.append(dict(c))
     return order, pk
 
 
-def build_layout(sch, pk, conv, n_core):
+def build_layout(sch, pk, conv, n_core, chvar=None):
+    # chvar overrides how CHAR columns in an unrecognised charset are held:
+    # True = preceded by a length byte, False = padded to a fixed width.
     order, pk2 = order_for(sch, pk)
+    if chvar is not None:
+        for c in order:
+            if c.get('amb'):
+                c['var'] = chvar
     n_core = max(len(pk2) + 2, min(n_core, len(order)))
     cache = {}
 
@@ -1007,7 +1028,7 @@ def build_layout(sch, pk, conv, n_core):
         return got
 
     return dict(order=order, pk=pk2, conv=conv, n_core=n_core, prep=prep_n,
-                total=len(order))
+                total=len(order), chvar=chvar)
 
 
 def parse_rec(pg, o, lay, keep_deleted=False):
@@ -1118,13 +1139,15 @@ def plausible(c, v):
     return 0
 
 
-def fit_score(pages, lay):
+def fit_score(pages, lay, maxrecs=0):
     # (share of records ending exactly where the next begins, sanity, -errors)
     fit = pairs = errs = rows = pts = 0
     real = [c for c in lay['order'] if not c.get('sys')]
     for pg in pages:
         top = u(pg, 40, 2)
         recs = page_records(pg, lay)
+        if maxrecs:
+            recs = recs[:maxrecs]
         errs += sum(1 for r in recs if r.get('err'))
         ok = sorted([r for r in recs if r.get('start') is not None
                      and r.get('end')], key=lambda r: r['start'])
@@ -1145,23 +1168,31 @@ def fit_score(pages, lay):
 
 
 def solve_layout(pages, sch, deep=True):
-    # Search key width, var-length convention and instant field count.
-    best = None
+    # Unknowns: key width, CHAR storage, length-array direction, and how many
+    # fields ordinary records carry. All are decided by the bytes, in two
+    # passes: a cheap screening on one page, then full scoring of finalists.
+    cands = []
     pkv = [sch['pk'][:n] for n in range(len(sch['pk']), 0, -1)] or [[]]
+    amb = any(c.get('amb') for c in sch['cols'])
     for pk in pkv:
         order, pk2 = order_for(sch, pk)
         total = len(order)
-        nvar = sum(1 for c in order if c.get('var') and not c.get('sys'))
-        convs = (0, 1) if nvar > 1 else (0,)
         lo = (len(pk2) + 2) if deep else total
-        for n_core in range(total, lo - 1, -1):
-            for conv in convs:
-                lay = build_layout(sch, pk, conv, n_core)
-                sc = fit_score(pages, lay)
-                if best is None or sc > best[0]:
-                    best = (sc, lay)
-            if best and best[0][0] >= 0.995 and best[0][2] == 0:
-                break        # this key width is settled; still compare others
+        for chvar in ((None, True, False) if amb else (None,)):
+            for n_core in range(total, lo - 1, -1):
+                for conv in (0, 1):
+                    lay = build_layout(sch, pk, conv, n_core, chvar)
+                    nvar = sum(1 for c in lay['order']
+                               if c.get('var') and not c.get('sys'))
+                    if conv and nvar < 2:
+                        continue
+                    cands.append((fit_score(pages[:1], lay, 12), lay))
+    cands.sort(key=lambda t: t[0], reverse=True)
+    best = None
+    for _, lay in cands[:8]:
+        sc = fit_score(pages, lay)
+        if best is None or sc > best[0]:
+            best = (sc, lay)
     return best
 
 
