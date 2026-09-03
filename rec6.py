@@ -1471,6 +1471,7 @@ def do_diag(pos, opt):
           % (u(pg, 4, 4), u(pg, 54, 2), u(pg, 42, 2) & 0x7FFF,
              u(pg, 40, 2), u(pg, 44, 2), u(pg, 50, 2) >> 3))
     sc, lay = solve_layout(sample, s)
+    lay, sc = force_core(sample, s, lay, sc, opt)
     print('solved pk=%s conv=%d core=%d/%d fit=%s sanity=%s errs=%d'
           % (','.join(lay['pk']) or '-', lay['conv'], lay['n_core'],
              lay['total'], sc[0], sc[1], -sc[2]))
@@ -1487,7 +1488,8 @@ def do_diag(pos, opt):
             print('   err=%s' % r['err'])
             continue
         print('   fields=%d bytes=%d..%d' % (r['nf'], r['start'], r['end']))
-        for c in s['cols'][:7]:
+        c0 = int(opt.get('c0', 0))
+        for c in s['cols'][c0:c0 + 7]:
             print('   %-20s %s' % (c['name'], str(r['row'].get(c['name']))[:52]))
 
 
@@ -1591,6 +1593,7 @@ def do_hex(pos, opt):
         return
     pg = sample[0]
     sc, lay = solve_layout(sample, s)
+    lay, sc = force_core(sample, s, lay, sc, opt)
     offs, o = [], 99
     for _ in range(PG // 5):
         o = (o + u(pg, o - 2, 2)) & 0xFFFF
@@ -1629,15 +1632,82 @@ def do_hex(pos, opt):
             print(line)
 
 
+def force_core(sample, s, lay, sc, opt):
+    # --core N pins how many fields ordinary records carry instead of
+    # trusting the solver's pick.
+    if not opt.get('core'):
+        return lay, sc
+    lay = build_layout(s, lay['pk'], lay['conv'], int(opt['core']),
+                       lay.get('chvar'))
+    return lay, fit_score(sample, lay)
+
+
+def do_fit(pos, opt):
+    # Sweep the core-field count. For every candidate the reference record's
+    # calculated length is set against its physical length, so a missing or
+    # an over-counted field shows up as a constant offset.
+    nm = opt.get('table', 'users')
+    src = opt.get('in', DEF_OUT)
+    paths = [opt.get('dict', DEF_DICT)]
+    db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
+    span = int(opt.get('span', 9))
+    i = int(opt.get('skip', 1))
+    conv = int(opt.get('conv', 0))
+    ch = opt.get('chvar')
+    chvar = None if ch is None else (ch not in ('0', 'false', 'no'))
+    set_ghosts(opt)
+    sch, _ = build_schema(paths, db)
+    s = sch.get(nm)
+    if not s:
+        print('no dictionary entry for %s' % nm)
+        return
+    prep(s, nm, opt.get('merge', DEF_DEFS))
+    files, ix, why = choose_files(src, nm, s)
+    if not files:
+        print('no pages for %s in %s' % (nm, src))
+        return
+    sample = sample_pages(files)
+    if not sample:
+        print('no leaf pages with records')
+        return
+    pg = sample[0]
+    offs, o = [], 99
+    for _ in range(PG // 5):
+        o = (o + u(pg, o - 2, 2)) & 0xFFFF
+        if o == 112 or o < 99 or o >= PG:
+            break
+        offs.append(o)
+    order, pk2 = order_for(s, s['pk'])
+    total = len(order)
+    print('%s page=%d recs=%d total=%d conv=%d rec@%d'
+          % (nm, u(pg, 4, 4), len(offs), total, conv,
+             offs[i] if i < len(offs) else -1))
+    print('#core nf  calc true delta   fit  sane errs')
+    lo = max(len(pk2) + 2, total - span)
+    for n_core in range(total, lo - 1, -1):
+        lay = build_layout(s, s['pk'], conv, n_core, chvar)
+        sc = fit_score(sample, lay)
+        calc = true = nf = 0
+        if i < len(offs):
+            r = parse_rec(pg, offs[i], lay, True)
+            nf = r.get('nf') or 0
+            calc = (r.get('end') or 0) - offs[i]
+            if i + 1 < len(offs):
+                nx = parse_rec(pg, offs[i + 1], lay, True).get('start') or 0
+                true = (nx - offs[i]) if nx else 0
+        print('%4d %3d %5d %5d %5d %5s %5s %4d'
+              % (n_core, nf, calc, true, true - calc, sc[0], sc[1], -sc[2]))
+
+
 MODES = {"cols": do_cols, "defs": do_defs, "dump": do_dump,
          "xcheck": do_xcheck, "diag": do_diag,
-         "hex": do_hex, "probe": do_probe, "map": do_map, "inv": do_inv,
+         "hex": do_hex, "fit": do_fit, "probe": do_probe, "map": do_map, "inv": do_inv,
          "plan": do_plan, "auto": do_auto, "pull": do_pull}
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in MODES:
-        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex ...")
+        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex|fit ...")
         return 1
     pos, opt = split_args(sys.argv[2:])
     MODES[sys.argv[1]](pos, opt)
