@@ -966,18 +966,17 @@ def dec_val(c, raw):
 
 
 # =========================================================== record decoding
-# Variable-length array conventions:
-#   conv 0 (InnoDB source): lengths in ascending field order walking down from
-#           the null bitmap; in the two-byte form the flag/high byte is the
-#           one nearer the header (pos-1), the low byte is at pos-2.
-#   conv 1 (iparse.py style): descending field order, low byte at pos-1.
-# Both are tried on real pages and the better scoring one wins per table.
-def rec_order(sch):
-    # Clustered record order: PK cols, DB_TRX_ID, DB_ROLL_PTR, then the rest.
+# Two unknowns are resolved from the data itself, not guessed:
+#   * var-length array convention: conv 0 follows the InnoDB source (ascending
+#     field order, flag/high byte nearest the header), conv 1 is iparse.py's
+#     reversed reading.
+#   * primary key width: SYS_FIELDS can over-collect, so shorter prefixes of
+#     the key are tried too. A wrong key shifts every field after it.
+def order_for(sch, pk):
     by = {}
     for c in sch['cols']:
         by[c['name']] = c
-    pk = [p for p in sch['pk'] if p in by]
+    pk = [p for p in pk if p in by]
     order = [by[p] for p in pk]
     order.append(dict(name='DB_TRX_ID', sys=True, len=6, var=False))
     order.append(dict(name='DB_ROLL_PTR', sys=True, len=7, var=False))
@@ -992,6 +991,10 @@ def rec_order(sch):
         if not c['notnull']:
             nullable.append(c['name'])
     return order, nullable, (len(nullable) + 7) // 8, pk
+
+
+def rec_order(sch):
+    return order_for(sch, sch['pk'])
 
 
 def decode_rec(pg, o, order, nullable, nbm, keep_deleted, conv=0):
@@ -1012,27 +1015,18 @@ def decode_rec(pg, o, order, nullable, nbm, keep_deleted, conv=0):
             continue
         if pos - 2 < 0:
             return None, 'vlen'
-        first = pg[pos - 1]
-        second = pg[pos - 2]
-        if c.get('len', 0) < 256:
+        first, second = pg[pos - 1], pg[pos - 2]
+        if c.get('len', 0) < 256 or first < 0x80:
             vlen[nm] = first
             pos -= 1
         elif conv == 0:
-            if first < 0x80:
-                vlen[nm] = first
-                pos -= 1
-            else:
-                vlen[nm] = ((first & 0x3F) << 8) | second
-                ext[nm] = bool(first & 0x40)
-                pos -= 2
+            vlen[nm] = ((first & 0x3F) << 8) | second
+            ext[nm] = bool(first & 0x40)
+            pos -= 2
         else:
-            if first < 0x80:
-                vlen[nm] = first
-                pos -= 1
-            else:
-                vlen[nm] = ((second & 0x3F) << 8) | first
-                ext[nm] = bool(second & 0x40)
-                pos -= 2
+            vlen[nm] = ((second & 0x3F) << 8) | first
+            ext[nm] = bool(second & 0x40)
+            pos -= 2
     p = o
     row = {}
     for c in order:
@@ -1074,33 +1068,55 @@ def decode_page(pg, order, nullable, nbm, keep_deleted=False, conv=0):
     return rows, errs
 
 
+TEMPORAL = (7, 10, 12, 14, 17, 18)
+
+
+def plausible(c, v):
+    # Cheap sanity signal used only to compare candidate layouts.
+    if v is None:
+        return 0
+    if isinstance(v, str) and chr(0xFFFD) in v:
+        return -2
+    if c['code'] in TEMPORAL and isinstance(v, str) and len(v) >= 4:
+        y = v[:4]
+        return 1 if (y.isdigit() and 1990 <= int(y) <= 2035) else -2
+    if c['mt'] == 6 and isinstance(v, int):
+        return 1 if abs(v) < (1 << 40) else -1
+    if isinstance(v, str) and c.get('var'):
+        return 1
+    return 0
+
+
 def score_conv(pages, order, nullable, nbm, conv):
-    # Higher is better: clean records, valid UTF-8 text, no decode failures.
-    good = bad = txt = ok = 0
-    varcols = [c['name'] for c in order if c.get('var') and not c.get('sys')]
+    good = bad = pts = 0
+    real = [c for c in order if not c.get('sys')]
     for pg in pages:
         rows, errs = decode_page(pg, order, nullable, nbm, False, conv)
         good += len(rows)
         bad += sum(v for k, v in errs.items() if k != 'deleted')
         for r in rows:
-            for nm in varcols:
-                v = r.get(nm)
-                if isinstance(v, str):
-                    txt += 1
-                    if chr(0xFFFD) not in v:
-                        ok += 1
-    return (ok - (txt - ok) * 2, good - bad * 3)
+            for c in real:
+                pts += plausible(c, r.get(c['name']))
+    return (pts, good - bad * 3)
 
 
-def pick_conv(pages, order, nullable, nbm):
-    nvar = sum(1 for c in order if c.get('var') and not c.get('sys'))
-    if nvar < 2 or not pages:
-        return 0, 'single-var'
-    s0 = score_conv(pages, order, nullable, nbm, 0)
-    s1 = score_conv(pages, order, nullable, nbm, 1)
-    if s1 > s0:
-        return 1, 'scored %s vs %s' % (s1, s0)
-    return 0, 'scored %s vs %s' % (s0, s1)
+def pk_variants(sch):
+    pk = sch['pk']
+    out = [pk[:n] for n in range(len(pk), 0, -1)]
+    return out or [[]]
+
+
+def pick_layout(pages, sch):
+    # Try key widths and both var-length conventions; keep the best scoring.
+    best = None
+    for pk in pk_variants(sch):
+        order, nullable, nbm, pk2 = order_for(sch, pk)
+        nvar = sum(1 for c in order if c.get('var') and not c.get('sys'))
+        for conv in ((0, 1) if nvar > 1 else (0,)):
+            sc = score_conv(pages, order, nullable, nbm, conv)
+            if best is None or sc > best[0]:
+                best = (sc, pk2, conv, order, nullable, nbm)
+    return best
 
 
 BS = chr(92)
@@ -1129,18 +1145,18 @@ def leaf_pages(files):
                 yield pg
 
 
-def dump_table(sch, files, dest, keep_deleted=False, limit=0, conv=None):
-    # Decode all leaf pages of a table, dedup by PK keeping the newest LSN.
-    order, nullable, nbm, pk = rec_order(sch)
+def dump_table(sch, files, dest, keep_deleted=False, limit=0, sample_n=12):
+    # Decode all leaf pages, dedup by key keeping the newest LSN.
     names = [c['name'] for c in sch['cols']]
     sample = []
     for pg in leaf_pages(files):
         sample.append(pg)
-        if len(sample) >= 12:
+        if len(sample) >= sample_n:
             break
-    why = 'forced'
-    if conv is None:
-        conv, why = pick_conv(sample, order, nullable, nbm)
+    if not sample:
+        return dict(pages=0, rows=0, errs=collections.Counter(), conv=0,
+                    pk=sch['pk'], score=(0, 0))
+    sc, pk, conv, order, nullable, nbm = pick_layout(sample, sch)
     best = {}
     errs = collections.Counter()
     pages = 0
@@ -1150,10 +1166,8 @@ def dump_table(sch, files, dest, keep_deleted=False, limit=0, conv=None):
         rows, e = decode_page(pg, order, nullable, nbm, keep_deleted, conv)
         errs.update(e)
         for r in rows:
-            if pk:
-                key = tuple(str(r.get(p)) for p in pk)
-            else:
-                key = tuple(str(r.get(n)) for n in names)
+            keycols = pk or names
+            key = tuple(str(r.get(k)) for k in keycols)
             cur = best.get(key)
             if cur is None or cur[0] < lsn:
                 best[key] = (lsn, r)
@@ -1168,12 +1182,13 @@ def dump_table(sch, files, dest, keep_deleted=False, limit=0, conv=None):
         if limit and kept >= limit:
             break
     fh.close()
-    return dict(pages=pages, rows=kept, errs=errs, conv=conv, why=why)
+    return dict(pages=pages, rows=kept, errs=errs, conv=conv, pk=pk, score=sc)
 
 
 # ==================================================================== modes
 DEF_DEFS6 = '/mnt/recovery/defs6'
 DEF_TSV = '/mnt/recovery/tsv'
+IX_RE = re.compile(r'\.ix(\d+)\.page$')
 
 
 def prep(sch, nm, known):
@@ -1183,6 +1198,40 @@ def prep(sch, nm, known):
         hit = merge_known(sch, kp)
     apply_sql_override(sch)
     return hit
+
+
+def group_by_index(files):
+    g = {}
+    for f in files:
+        m = IX_RE.search(f)
+        g.setdefault(int(m.group(1)) if m else 0, []).append(f)
+    return g
+
+
+def choose_files(src, nm, sch):
+    # Prefer the clustered index from the dictionary; otherwise score the
+    # available indexes and use the one that decodes as a table.
+    g = group_by_index(sorted(glob.glob(os.path.join(src, '%s.sp*.page' % nm))))
+    if not g:
+        return [], None, 'nofiles'
+    cl = sch.get('index')
+    if cl in g:
+        return g[cl], cl, 'dict'
+    best = None
+    for ix, fl in sorted(g.items()):
+        sample = []
+        for pg in leaf_pages(fl):
+            sample.append(pg)
+            if len(sample) >= 6:
+                break
+        if not sample:
+            continue
+        sc = pick_layout(sample, sch)[0]
+        if best is None or sc > best[0]:
+            best = (sc, ix, fl)
+    if best is None:
+        return [], None, 'empty'
+    return best[2], best[1], 'scored'
 
 
 def do_cols(pos, opt):
@@ -1219,7 +1268,6 @@ def do_defs(pos, opt):
     sch, info = build_schema(paths, db)
     for line in info:
         print(line)
-    print('# table cols pk source')
     n = 0
     for nm in sorted(sch):
         s = sch[nm]
@@ -1227,14 +1275,14 @@ def do_defs(pos, opt):
             print('%-28s NO COLUMNS' % nm)
             continue
         hit = prep(s, nm, known)
-        dest = os.path.join(outdir, nm + '.sql')
-        fh = open(dest, 'w', encoding='utf-8')
+        fh = open(os.path.join(outdir, nm + '.sql'), 'w', encoding='utf-8')
         fh.write(emit_def(s))
         fh.close()
         n += 1
-        src = ('merged %d' % hit) if hit else 'dict'
-        print('%-28s %3d %-18s %s' % (nm, len(s['cols']),
-                                      ','.join(s['pk']) or '-', src))
+        if opt.get('v'):
+            print('%-28s %3d %-18s %s'
+                  % (nm, len(s['cols']), ','.join(s['pk']) or '-',
+                     ('merged %d' % hit) if hit else 'dict'))
     print('# wrote %d defs to %s' % (n, outdir))
 
 
@@ -1251,26 +1299,31 @@ def do_dump(pos, opt):
     sch, info = build_schema(paths, db)
     for line in info:
         print(line)
-    print('# table pages rows errors file')
-    tot = 0
+    print('# table ix src pages rows key conv errors')
+    tot, done, empty = 0, 0, []
     for nm in sorted(sch):
         if only and only != nm:
             continue
         s = sch[nm]
         if not s['cols']:
             continue
-        files = sorted(glob.glob(os.path.join(src, '%s.sp*.page' % nm)))
+        files, ix, why = choose_files(src, nm, s)
         if not files:
+            empty.append(nm)
             continue
         prep(s, nm, known)
-        dest = os.path.join(outdir, nm + '.tsv')
-        r = dump_table(s, files, dest, keep_del, limit)
-        top = ','.join('%s=%d' % kv for kv in r['errs'].most_common(3))
-        print('%-28s %5d %7d %-22s %s'
-              % (nm, r['pages'], r['rows'], top or '-',
-                 os.path.basename(dest)))
+        r = dump_table(s, files, os.path.join(outdir, nm + '.tsv'),
+                       keep_del, limit)
+        bad = ','.join('%s=%d' % kv for kv in r['errs'].most_common(2))
+        print('%-26s %-6s %-6s %5d %7d %-14s c%d %s'
+              % (nm, ix, why, r['pages'], r['rows'],
+                 ','.join(r['pk'])[:14] or '-', r['conv'], bad or '-'))
         tot += r['rows']
-    print('# total rows %d -> %s' % (tot, outdir))
+        done += 1
+    if empty:
+        print('# no pages: ' + ' '.join(empty[:8]) +
+              (' +%d' % (len(empty) - 8) if len(empty) > 8 else ''))
+    print('# tables %d rows %d -> %s' % (done, tot, outdir))
 
 
 def do_xcheck(pos, opt):
@@ -1281,37 +1334,38 @@ def do_xcheck(pos, opt):
     iparse = opt.get('iparse', IPARSE)
     paths = [opt.get('dict', DEF_DICT)]
     db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
-    files = sorted(glob.glob(os.path.join(src, '%s.sp*.page' % nm)))
-    dpath = os.path.join(defs, nm + '.sql')
-    if not files or not os.path.exists(dpath):
-        print('need pages in %s and def %s' % (src, dpath))
-        return
     sch, _ = build_schema(paths, db)
     s = sch.get(nm)
     if not s:
         print('no dictionary entry for %s' % nm)
         return
+    files, ix, why = choose_files(src, nm, s)
+    dpath = os.path.join(defs, nm + '.sql')
+    if not files:
+        print('no pages for %s in %s' % (nm, src))
+        return
     prep(s, nm, defs)
     mine = os.path.join(src, nm + '.mine.tsv')
     r = dump_table(s, files[:1], mine, False, 0)
+    a = [l.rstrip(chr(10)) for l in open(mine, encoding='utf-8')][1:]
+    print('%s ix=%s (%s) pages=%d rows=%d key=%s conv=%d errs=%s'
+          % (nm, ix, why, r['pages'], r['rows'], ','.join(r['pk']) or '-',
+             r['conv'], dict(r['errs']) or 'none'))
+    for x in a[:4]:
+        print('  ours   %s' % x[:130])
+    if not os.path.exists(dpath) or not os.path.exists(iparse):
+        print('  (no iparse def for cross-check)')
+        return
     theirs = os.path.join(src, nm + '.iparse.tsv')
     fh = open(theirs, 'wb')
     subprocess.run([sys.executable, iparse, dpath, files[0]], stdout=fh)
     fh.close()
-    a = [l.rstrip(chr(10)) for l in open(mine, encoding='utf-8')][1:]
     b2 = [l.rstrip(chr(10)) for l in
           open(theirs, encoding='utf-8', errors='replace')]
-    print('file %s  pages=%d' % (os.path.basename(files[0]), r['pages']))
-    print('ours %d rows, iparse %d rows' % (len(a), len(b2)))
-    aset = set(a)
-    common = sum(1 for x in b2 if x in aset)
-    print('identical rows %d of %d iparse rows' % (common, len(b2)))
-    print('pk=%s errors=%s' % (','.join(s['pk']) or '-',
-                               dict(r['errs']) or 'none'))
-    for x in a[:3]:
-        print('  ours   %s' % x[:140])
-    for x in b2[:3]:
-        print('  iparse %s' % x[:140])
+    same = len(set(a) & set(b2))
+    print('  iparse rows %d, identical %d' % (len(b2), same))
+    for x in b2[:2]:
+        print('  iparse %s' % x[:130])
 
 
 MODES = {"cols": do_cols, "defs": do_defs, "dump": do_dump,
