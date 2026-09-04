@@ -999,8 +999,8 @@ GHOSTS = []
 
 # Columns to push to the end of the physical field order, as "name" or
 # "table:name". An instantly added column is written at the end of every
-# record while SYS_COLUMNS lists it wherever ADD COLUMN ... AFTER put it, so
-# the dictionary order and the physical order can disagree.
+# record while SYS_COLUMNS lists it wherever ADD COLUMN ... AFTER put it,
+# so the dictionary order and the physical order can disagree.
 ORDER_FIX = []
 
 
@@ -1737,19 +1737,25 @@ def set_moves(opt):
 
 def do_perm(pos, opt):
     # Recover the physical field order. An instantly added column is written
-    # at the end of every record regardless of where SYS_COLUMNS lists it,
-    # so a dictionary-ordered layout can expect a field in the middle of a
-    # record that is really at its end. Columns are pushed to the tail one at
-    # a time and the move that makes records tile best is kept.
+    # at the end of every record regardless of where SYS_COLUMNS lists it, so
+    # a dictionary-ordered layout can expect a field in the middle of a
+    # record that is really at its end. Columns are pushed to the tail with a
+    # beam search, keeping several partial orders alive so that one wrong
+    # first move cannot hide the right pair.
     nm = opt.get('table', 'users')
     src = opt.get('in', DEF_OUT)
     paths = [opt.get('dict', DEF_DICT)]
     db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
     span = int(opt.get('span', 9))
-    steps = int(opt.get('steps', 6))
+    steps = int(opt.get('steps', 4))
+    beam = int(opt.get('beam', 3))
+    show = int(opt.get('show', 5))
+    npg = int(opt.get('pages', 3))
+    nrec = int(opt.get('recs', 40))
     conv = int(opt.get('conv', 0))
     ch = opt.get('chvar')
     chvar = None if ch is None else (ch not in ('0', 'false', 'no'))
+    seed = opt.get('move')
     set_ghosts(opt)
     del ORDER_FIX[:]
     sch, _ = build_schema(paths, db)
@@ -1772,56 +1778,128 @@ def do_perm(pos, opt):
              if not c.get('sys') and not c.get('key') and not c.get('ghost')]
     lo = max(len(pk2) + 2, total - span)
 
-    def best_core(quick):
+    def qual(x):
+        return x if ':' in x else '%s:%s' % (nm, x)
+
+    def score(fix, quick, cores):
         out = None
-        for n_core in range(total, lo - 1, -1):
+        for n_core in cores:
+            ORDER_FIX[:] = list(fix)
             lay = build_layout(s, s['pk'], conv, n_core, chvar)
-            sc = fit_score(sample[:1] if quick else sample,
-                           lay, 14 if quick else 0)
+            sc = fit_score(sample[:npg] if quick else sample,
+                           lay, nrec if quick else 0)
             if out is None or sc > out[0]:
                 out = (sc, n_core)
         return out
 
-    cur = best_core(True)
-    print('%s pages=%d total=%d base core=%d fit=%s sane=%s errs=%d'
-          % (nm, len(sample), total, cur[1], cur[0][0], cur[0][1],
-             -cur[0][2]))
-    moved = []
+    allc = [c for c in range(total, lo - 1, -1)]
+    start = [qual(x) for x in str(seed).split(',') if x] if seed else []
+    cur = score(start, True, allc)
+    print('%s pages=%d/%d total=%d base core=%d fit=%s sane=%s'
+          % (nm, min(npg, len(sample)), len(sample), total, cur[1],
+             cur[0][0], cur[0][1]))
+    cores = [c for c in (cur[1], cur[1] - 1, cur[1] + 1) if lo <= c <= total]
+    beamst = [(cur[0], cur[1], start)]
+    seen = {tuple(start): 1}
     for step in range(steps):
-        pick = None
-        for cn in names:
-            if cn in moved:
-                continue
-            ORDER_FIX[:] = ['%s:%s' % (nm, x) for x in moved + [cn]]
-            got = best_core(True)
-            if pick is None or got[0] > pick[0][0]:
-                pick = (got, cn)
-        if pick is None or not (pick[0][0] > cur[0]):
+        cand = []
+        for sc0, core0, fix in beamst:
+            for cn in names:
+                q = qual(cn)
+                if q in fix:
+                    continue
+                nfix = fix + [q]
+                if tuple(nfix) in seen:
+                    continue
+                seen[tuple(nfix)] = 1
+                got = score(nfix, True, cores)
+                cand.append((got[0], got[1], nfix))
+        if not cand:
             break
-        cur, cn = pick[0], pick[1]
-        moved.append(cn)
-        print('step%d tail %-22s core=%d fit=%s sane=%s errs=%d'
-              % (step + 1, cn, cur[1], cur[0][0], cur[0][1], -cur[0][2]))
-        if cur[0][0] >= 1.0:
+        cand.sort(key=lambda x: x[0], reverse=True)
+        for c in (cand[:show] if step == 0 else cand[:1]):
+            print(' %-28s core=%d fit=%s sane=%s'
+                  % (','.join(x.split(':')[-1] for x in c[2])[:28], c[1],
+                     c[0][0], c[0][1]))
+        if not (cand[0][0] > beamst[0][0]):
             break
-    ORDER_FIX[:] = ['%s:%s' % (nm, x) for x in moved]
-    fin = best_core(False)
+        beamst = cand[:beam]
+    fin, bfix = None, start
+    for sc0, core0, fix in beamst[:3]:
+        got = score(fix, False, allc)
+        if fin is None or got[0] > fin[0]:
+            fin, bfix = got, fix
+    ORDER_FIX[:] = []
     print('final core=%d fit=%s sane=%s errs=%d'
           % (fin[1], fin[0][0], fin[0][1], -fin[0][2]))
-    if moved:
-        print('use: --core %d --move %s'
-              % (fin[1], ','.join('%s:%s' % (nm, x) for x in moved)))
+    if bfix:
+        print('use: --core %d --move %s' % (fin[1], ','.join(bfix)))
+
+
+def do_gap(pos, opt):
+    # Tiling error grouped by how many fields a record carries. A layout that
+    # is right for rows written after the last ALTER and wrong for older ones
+    # shows up as a constant offset on one field count only, which names the
+    # missing or over-counted field instead of leaving it to a search.
+    nm = opt.get('table', 'users')
+    src = opt.get('in', DEF_OUT)
+    paths = [opt.get('dict', DEF_DICT)]
+    db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
+    set_ghosts(opt)
+    set_moves(opt)
+    sch, _ = build_schema(paths, db)
+    s = sch.get(nm)
+    if not s:
+        print('no dictionary entry for %s' % nm)
+        return
+    prep(s, nm, opt.get('merge', DEF_DEFS))
+    files, ix, why = choose_files(src, nm, s)
+    if not files:
+        print('no pages for %s in %s' % (nm, src))
+        return
+    sample = sample_pages(files)
+    if not sample:
+        print('no leaf pages with records')
+        return
+    sc, lay = solve_layout(sample, s)
+    lay, sc = force_core(sample, s, lay, sc, opt)
+    print('%s pages=%d core=%d/%d fit=%s sane=%s'
+          % (nm, len(sample), lay['n_core'], lay['total'], sc[0], sc[1]))
+    agg, tot = {}, 0
+    for pg in sample:
+        offs, o = [], 99
+        for _ in range(PG // 5):
+            o = (o + u(pg, o - 2, 2)) & 0xFFFF
+            if o == 112 or o < 99 or o >= PG:
+                break
+            offs.append(o)
+        rs = []
+        for o in offs:
+            r = parse_rec(pg, o, lay, True)
+            rs.append(None if r.get('err') else r)
+        for i in range(len(rs) - 1):
+            a, b = rs[i], rs[i + 1]
+            if not a or not b:
+                continue
+            k = (a['nf'], (b.get('start') or 0) - (a.get('end') or 0))
+            agg[k] = agg.get(k, 0) + 1
+            tot += 1
+    print('#pairs %d' % tot)
+    for k in sorted(agg, key=lambda k: -agg[k])[:12]:
+        print('nf=%2d short=%+4d n=%4d %3d%%'
+              % (k[0], k[1], agg[k], 100 * agg[k] // max(tot, 1)))
 
 
 MODES = {"cols": do_cols, "defs": do_defs, "dump": do_dump,
          "xcheck": do_xcheck, "diag": do_diag, "perm": do_perm,
+         "gap": do_gap,
          "hex": do_hex, "fit": do_fit, "probe": do_probe, "map": do_map, "inv": do_inv,
          "plan": do_plan, "auto": do_auto, "pull": do_pull}
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in MODES:
-        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex|fit|perm ...")
+        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex|fit|perm|gap ...")
         return 1
     pos, opt = split_args(sys.argv[2:])
     MODES[sys.argv[1]](pos, opt)
