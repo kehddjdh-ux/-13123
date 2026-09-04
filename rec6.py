@@ -1836,6 +1836,92 @@ def do_perm(pos, opt):
         print('use: --core %d --move %s' % (fin[1], ','.join(bfix)))
 
 
+def bit_pat(pg, r):
+    nbm = r.get('nbm') or 0
+    base = r.get('base') or 0
+    if nbm <= 0 or base - nbm < 14:
+        return None, 0
+    v = int.from_bytes(pg[base - nbm:base], 'big')
+    out = ''
+    for j in range(nbm * 8):
+        out += '1' if (v >> j) & 1 else '0'
+    return out, base - nbm
+
+
+def do_bits(pos, opt):
+    # Raw physical evidence grouped by null bitmap pattern. For one record of
+    # each pattern: G = distance to the next record start, plus the header
+    # bytes below the bitmap, which are the length bytes. The stored fixed
+    # width is G - 8 - k - sum(k length bytes), so the set of fields actually
+    # present follows from arithmetic instead of a search over orders.
+    nm = opt.get('table', 'users')
+    src = opt.get('in', DEF_OUT)
+    paths = [opt.get('dict', DEF_DICT)]
+    db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
+    set_ghosts(opt)
+    set_moves(opt)
+    sch, _ = build_schema(paths, db)
+    s = sch.get(nm)
+    if not s:
+        print('no dictionary entry for %s' % nm)
+        return
+    prep(s, nm, opt.get('merge', DEF_DEFS))
+    files, ix, why = choose_files(src, nm, s)
+    if not files:
+        print('no pages for %s in %s' % (nm, src))
+        return
+    sample = sample_pages(files)
+    if not sample:
+        print('no leaf pages with records')
+        return
+    sc, lay = solve_layout(sample, s)
+    lay, sc = force_core(sample, s, lay, sc, opt)
+    print('%s pages=%d core=%d/%d fit=%s'
+          % (nm, len(sample), lay['n_core'], lay['total'], sc[0]))
+    agg, tot = {}, 0
+    for pg in sample:
+        offs, o = [], 99
+        for _ in range(PG // 5):
+            o = (o + u(pg, o - 2, 2)) & 0xFFFF
+            if o == 112 or o < 99 or o >= PG:
+                break
+            offs.append(o)
+        rs = []
+        for o in offs:
+            r = parse_rec(pg, o, lay, True)
+            rs.append(None if r.get('err') else (o, r))
+        for i in range(len(rs) - 1):
+            if not rs[i] or not rs[i + 1]:
+                continue
+            oa, ra = rs[i]
+            ob, rb = rs[i + 1]
+            pa, low = bit_pat(pg, ra)
+            pb, _ = bit_pat(pg, rb)
+            if pa is None or pb is None or low < 24:
+                continue
+            g = ob - oa
+            if g < 20 or g > 900:
+                continue
+            key = (ra['nf'], pa)
+            e = agg.get(key)
+            if e is None:
+                e = [0, 0, '', 0]
+                agg[key] = e
+            e[0] += 1
+            fresh = 1 if pb == pa else 0
+            if fresh >= e[3] and (fresh > e[3] or not e[1]):
+                e[1] = g
+                e[2] = ' '.join('%02x' % pg[low - 1 - t] for t in range(8))
+                e[3] = fresh
+            tot += 1
+    print('#recs %d pats %d' % (tot, len(agg)))
+    print('nullmap            nf    n    G  below')
+    for k in sorted(agg, key=lambda k: -agg[k][0])[:10]:
+        e = agg[k]
+        print('%s  %2d %4d %4d  %s%s'
+              % (k[1], k[0], e[0], e[1], e[2], '' if e[3] else ' *'))
+
+
 def do_gap(pos, opt):
     # Tiling error grouped by how many fields a record carries. A layout that
     # is right for rows written after the last ALTER and wrong for older ones
@@ -1892,14 +1978,14 @@ def do_gap(pos, opt):
 
 MODES = {"cols": do_cols, "defs": do_defs, "dump": do_dump,
          "xcheck": do_xcheck, "diag": do_diag, "perm": do_perm,
-         "gap": do_gap,
+         "gap": do_gap, "bits": do_bits,
          "hex": do_hex, "fit": do_fit, "probe": do_probe, "map": do_map, "inv": do_inv,
          "plan": do_plan, "auto": do_auto, "pull": do_pull}
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in MODES:
-        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex|fit|perm|gap ...")
+        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex|fit|perm|gap|bits ...")
         return 1
     pos, opt = split_args(sys.argv[2:])
     MODES[sys.argv[1]](pos, opt)
