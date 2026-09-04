@@ -997,6 +997,12 @@ REC_INSTANT = 4
 # whether records start tiling. Empty in normal operation.
 GHOSTS = []
 
+# Columns to push to the end of the physical field order, as "name" or
+# "table:name". An instantly added column is written at the end of every
+# record while SYS_COLUMNS lists it wherever ADD COLUMN ... AFTER put it, so
+# the dictionary order and the physical order can disagree.
+ORDER_FIX = []
+
 
 def order_for(sch, pk):
     by = {}
@@ -1010,6 +1016,18 @@ def order_for(sch, pk):
     for c in sch['cols']:
         if c['name'] not in pks:
             order.append(dict(c))
+    if ORDER_FIX:
+        tab = sch.get('table')
+        late = []
+        for spec in ORDER_FIX:
+            t, _, cn = spec.rpartition(':')
+            if t and t != tab:
+                continue
+            for i, c in enumerate(order):
+                if c['name'] == cn and not c.get('key') and not c.get('sys'):
+                    late.append(order.pop(i))
+                    break
+        order.extend(late)
     for n, g in enumerate(GHOSTS):
         at, w, nul = g
         order.insert(min(max(at, 0), len(order)),
@@ -1401,6 +1419,7 @@ def do_dump(pos, opt):
     keep_del = bool(opt.get('deleted'))
     known = opt.get('merge', DEF_DEFS)
     set_ghosts(opt)
+    set_moves(opt)
     os.makedirs(outdir, exist_ok=True)
     sch, info = build_schema(paths, db)
     for line in info:
@@ -1450,6 +1469,7 @@ def do_diag(pos, opt):
     db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
     nrec = int(opt.get('recs', 2))
     set_ghosts(opt)
+    set_moves(opt)
     sch, _ = build_schema(paths, db)
     s = sch.get(nm)
     if not s:
@@ -1577,6 +1597,7 @@ def do_hex(pos, opt):
     nrec = int(opt.get('recs', 1))
     skip = int(opt.get('skip', 0))
     set_ghosts(opt)
+    set_moves(opt)
     sch, _ = build_schema(paths, db)
     s = sch.get(nm)
     if not s:
@@ -1656,6 +1677,7 @@ def do_fit(pos, opt):
     ch = opt.get('chvar')
     chvar = None if ch is None else (ch not in ('0', 'false', 'no'))
     set_ghosts(opt)
+    set_moves(opt)
     sch, _ = build_schema(paths, db)
     s = sch.get(nm)
     if not s:
@@ -1699,15 +1721,107 @@ def do_fit(pos, opt):
               % (n_core, nf, calc, true, true - calc, sc[0], sc[1], -sc[2]))
 
 
+def set_moves(opt):
+    # --move users:updated_at pushes a column to the end of the physical
+    # field order. Names are table-qualified because a name like updated_at
+    # exists in nearly every table and must not affect the others.
+    del ORDER_FIX[:]
+    spec = opt.get('move')
+    if not spec:
+        return
+    for part in str(spec).split(','):
+        if part:
+            ORDER_FIX.append(part)
+    print('# tail order %s' % ','.join(ORDER_FIX))
+
+
+def do_perm(pos, opt):
+    # Recover the physical field order. An instantly added column is written
+    # at the end of every record regardless of where SYS_COLUMNS lists it,
+    # so a dictionary-ordered layout can expect a field in the middle of a
+    # record that is really at its end. Columns are pushed to the tail one at
+    # a time and the move that makes records tile best is kept.
+    nm = opt.get('table', 'users')
+    src = opt.get('in', DEF_OUT)
+    paths = [opt.get('dict', DEF_DICT)]
+    db = None if opt.get('all') else opt.get('db', 'foxcoin_app')
+    span = int(opt.get('span', 9))
+    steps = int(opt.get('steps', 6))
+    conv = int(opt.get('conv', 0))
+    ch = opt.get('chvar')
+    chvar = None if ch is None else (ch not in ('0', 'false', 'no'))
+    set_ghosts(opt)
+    del ORDER_FIX[:]
+    sch, _ = build_schema(paths, db)
+    s = sch.get(nm)
+    if not s:
+        print('no dictionary entry for %s' % nm)
+        return
+    prep(s, nm, opt.get('merge', DEF_DEFS))
+    files, ix, why = choose_files(src, nm, s)
+    if not files:
+        print('no pages for %s in %s' % (nm, src))
+        return
+    sample = sample_pages(files)
+    if not sample:
+        print('no leaf pages with records')
+        return
+    order, pk2 = order_for(s, s['pk'])
+    total = len(order)
+    names = [c['name'] for c in order
+             if not c.get('sys') and not c.get('key') and not c.get('ghost')]
+    lo = max(len(pk2) + 2, total - span)
+
+    def best_core(quick):
+        out = None
+        for n_core in range(total, lo - 1, -1):
+            lay = build_layout(s, s['pk'], conv, n_core, chvar)
+            sc = fit_score(sample[:1] if quick else sample,
+                           lay, 14 if quick else 0)
+            if out is None or sc > out[0]:
+                out = (sc, n_core)
+        return out
+
+    cur = best_core(True)
+    print('%s pages=%d total=%d base core=%d fit=%s sane=%s errs=%d'
+          % (nm, len(sample), total, cur[1], cur[0][0], cur[0][1],
+             -cur[0][2]))
+    moved = []
+    for step in range(steps):
+        pick = None
+        for cn in names:
+            if cn in moved:
+                continue
+            ORDER_FIX[:] = ['%s:%s' % (nm, x) for x in moved + [cn]]
+            got = best_core(True)
+            if pick is None or got[0] > pick[0][0]:
+                pick = (got, cn)
+        if pick is None or not (pick[0][0] > cur[0]):
+            break
+        cur, cn = pick[0], pick[1]
+        moved.append(cn)
+        print('step%d tail %-22s core=%d fit=%s sane=%s errs=%d'
+              % (step + 1, cn, cur[1], cur[0][0], cur[0][1], -cur[0][2]))
+        if cur[0][0] >= 1.0:
+            break
+    ORDER_FIX[:] = ['%s:%s' % (nm, x) for x in moved]
+    fin = best_core(False)
+    print('final core=%d fit=%s sane=%s errs=%d'
+          % (fin[1], fin[0][0], fin[0][1], -fin[0][2]))
+    if moved:
+        print('use: --core %d --move %s'
+              % (fin[1], ','.join('%s:%s' % (nm, x) for x in moved)))
+
+
 MODES = {"cols": do_cols, "defs": do_defs, "dump": do_dump,
-         "xcheck": do_xcheck, "diag": do_diag,
+         "xcheck": do_xcheck, "diag": do_diag, "perm": do_perm,
          "hex": do_hex, "fit": do_fit, "probe": do_probe, "map": do_map, "inv": do_inv,
          "plan": do_plan, "auto": do_auto, "pull": do_pull}
 
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in MODES:
-        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex|fit ...")
+        print("usage: rec6.py probe|map|inv|plan|auto|pull|cols|defs|dump|diag|xcheck|hex|fit|perm ...")
         return 1
     pos, opt = split_args(sys.argv[2:])
     MODES[sys.argv[1]](pos, opt)
